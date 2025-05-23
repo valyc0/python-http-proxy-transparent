@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-HTTP Proxy Server with Request/Response Logging
+HTTP/HTTPS Proxy Server with Request/Response Logging and HTTPS Interception
 
-This script implements a simple HTTP proxy server that logs all requests and responses
-that pass through it. It's useful for debugging and analyzing HTTP traffic.
+This script implements a proxy server that logs all requests and responses that pass through it,
+including HTTPS traffic through TLS interception (MITM).
 
 Usage:
-    python3 http_proxy_logger.py [--host HOST] [--port PORT] [--target TARGET] [--logfile LOGFILE]
+    python3 http_proxy_logger_with_mitm.py [--host HOST] [--port PORT] [--target TARGET] 
+                                           [--logfile LOGFILE] [--transparent] [--cert CERT] [--key KEY]
 
-Examples:
-    python3 http_proxy_logger.py --port 8080 --target http://example.com
-    python3 http_proxy_logger.py --port 9000 --target http://api.example.org --logfile proxy.log
+Note: For HTTPS interception to work, clients need to trust the provided certificate or ignore SSL errors.
 """
 
 import argparse
@@ -19,10 +18,14 @@ import http.server
 import json
 import logging
 import os
+import select
 import socket
 import socketserver
+import ssl
 import sys
+import tempfile
 import threading
+import time
 import urllib.parse
 import urllib.request
 from http.client import HTTPResponse
@@ -40,7 +43,7 @@ def setup_logging(log_file=None):
     
     # Console handler
     console = logging.StreamHandler()
-    console.setLevel(logging.DEBUG)  # Changed from INFO to DEBUG to show all request/response details
+    console.setLevel(logging.DEBUG)
     console.setFormatter(formatter)
     logger.addHandler(console)
     
@@ -83,7 +86,7 @@ def format_http_message(headers, body, is_request=True, truncate_limit=None):
     """Format HTTP request or response for logging"""
     # Use the global truncate limit if not specified
     if truncate_limit is None:
-        truncate_limit = ProxyHTTPRequestHandler.truncate_limit
+        truncate_limit = 10000  # Default
     result = ""
     
     if is_request:
@@ -131,6 +134,41 @@ def format_http_message(headers, body, is_request=True, truncate_limit=None):
     return result
 
 
+def generate_self_signed_cert(cert_file, key_file):
+    """Generate a self-signed certificate if the provided files don't exist"""
+    if os.path.exists(cert_file) and os.path.exists(key_file):
+        return
+    
+    from OpenSSL import crypto
+    
+    # Create a key pair
+    k = crypto.PKey()
+    k.generate_key(crypto.TYPE_RSA, 2048)
+    
+    # Create a self-signed cert
+    cert = crypto.X509()
+    cert.get_subject().C = "US"
+    cert.get_subject().ST = "State"
+    cert.get_subject().L = "City"
+    cert.get_subject().O = "Organization"
+    cert.get_subject().OU = "Organizational Unit"
+    cert.get_subject().CN = "HTTP Proxy Logger"
+    cert.set_serial_number(1000)
+    cert.gmtime_adj_notBefore(0)
+    cert.gmtime_adj_notAfter(10*365*24*60*60)  # 10 years
+    cert.set_issuer(cert.get_subject())
+    cert.set_pubkey(k)
+    cert.sign(k, 'sha256')
+    
+    # Save the certificate
+    with open(cert_file, "wt") as f:
+        f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert).decode("utf-8"))
+    
+    # Save the key
+    with open(key_file, "wt") as f:
+        f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k).decode("utf-8"))
+
+
 class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     """HTTP Proxy Request Handler with logging"""
     
@@ -140,6 +178,9 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     target_port = None
     transparent_mode = False
     truncate_limit = 10000  # Default truncate limit (10000 characters)
+    ssl_context = None
+    cert_file = None
+    key_file = None
     
     def parse_target(self, path):
         """Parse and validate target URL"""
@@ -273,53 +314,181 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         self.logger.info(f"{self.client_address[0]} - CONNECT {host}:{port}")
         
         try:
-            # Connect to the target server
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.settimeout(10)
-            server_socket.connect((host, port))
-            
-            # Send connection established response
-            self.send_response(200, "Connection established")
-            self.end_headers()
-            
-            # Log the connection
+            # Log the connection request
             headers_dict = dict(self.headers.items())
             headers_dict['requestline'] = f"CONNECT {self.path} {self.protocol_version}"
             self.logger.debug(format_http_message(headers_dict, None, is_request=True))
             
-            # Create a two-way tunnel
-            # We need to use select to handle both connections, but for simplicity's sake,
-            # we'll use threads here (less efficient but easier to understand)
-            client_socket = self.request
+            # Send connection established response
+            self.send_response(200, "Connection established")
+            self.end_headers()
+            self.wfile.flush()  # Make sure the 200 response is sent immediately
             
-            # Set up tunneling in both directions
-            def forward_to_server():
+            # Record start time
+            start_time = time.time()
+            bytes_to_server = 0
+            bytes_to_client = 0
+            
+            # Get client connection
+            client_socket = self.connection
+            
+            if self.ssl_context:
+                # Create an SSL socket for the client
+                ssl_socket = self.ssl_context.wrap_socket(
+                    client_socket, 
+                    server_side=True,
+                    do_handshake_on_connect=True
+                )
+                
+                # Create a wrapper handler with the SSL socket
+                # This allows us to handle HTTPS requests directly
+                from io import BytesIO
+                
+                class SSLHandler(http.server.BaseHTTPRequestHandler):
+                    def __init__(self, request, client_address, server):
+                        self.connection = request
+                        self.client_address = client_address
+                        self.server = server
+                        # Create file-like objects for the socket
+                        self.rfile = request.makefile('rb', -1)
+                        self.wfile = request.makefile('wb', 0)
+                        
+                        # Save the target info
+                        self.target_host = host
+                        self.target_port = port
+                        self.logger = ProxyHTTPRequestHandler.logger
+                        self.transparent_mode = True  # Always true for SSL handler
+                        
+                    def handle_one_request(self):
+                        """Handle a single HTTP request."""
+                        try:
+                            self.raw_requestline = self.rfile.readline(65537)
+                            if len(self.raw_requestline) > 65536:
+                                self.requestline = ''
+                                self.request_version = ''
+                                self.command = ''
+                                self.send_error(414)
+                                return
+                            if not self.raw_requestline:
+                                return
+                            if not self.parse_request():
+                                # An error code has been sent, just exit
+                                return
+                                
+                            # Log this HTTPS request
+                            self.logger.info(f"HTTPS: {self.command} {self.path} (via {host}:{port})")
+                            
+                            # Modify the path to include the target host
+                            if not self.path.startswith('http://') and not self.path.startswith('https://'):
+                                self.path = f"https://{host}:{port}{self.path}"
+                                
+                            # Handle the request using the original handler's methods
+                            mname = 'do_' + self.command
+                            if not hasattr(self, mname):
+                                self.send_error(
+                                    501,
+                                    "Unsupported method (%r)" % self.command)
+                                return
+                            method = getattr(self, mname)
+                            method()
+                        except OSError as e:
+                            if e.errno == 9:  # Bad file descriptor
+                                self.logger.debug(f"Connection closed by client: {e}")
+                            else:
+                                self.logger.error(f"Socket error in HTTPS request handling: {e}")
+                            return
+                        except Exception as e:
+                            self.logger.error(f"Error handling HTTPS request: {e}")
+                            return
+                
+                # Add all the request handling methods to our SSL handler
+                for method_name in ['do_GET', 'do_POST', 'do_PUT', 'do_DELETE', 'do_OPTIONS', 'do_HEAD', 'do_PATCH', 'parse_target', 'do_request']:
+                    setattr(SSLHandler, method_name, getattr(ProxyHTTPRequestHandler, method_name))
+                
                 try:
-                    while True:
-                        data = client_socket.recv(4096)
-                        if not data:
+                    # Handle the SSL connection
+                    handler = SSLHandler(ssl_socket, self.client_address, self.server)
+                    handler.handle_one_request()
+                    # Don't try to read more after the first request is handled
+                    # This prevents Bad file descriptor errors when the connection is closed
+                except ssl.SSLError as e:
+                    self.logger.error(f"SSL Error: {e}")
+                except OSError as e:
+                    if e.errno == 9:  # Bad file descriptor
+                        self.logger.debug(f"Connection closed by client: {e}")
+                    else:
+                        self.logger.error(f"Socket error in HTTPS interception: {e}")
+                except Exception as e:
+                    self.logger.error(f"Error in HTTPS interception: {e}")
+            else:
+                # Without SSL interception, we just tunnel the traffic
+                # Connect to the target server
+                server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server_socket.settimeout(10)
+                server_socket.connect((host, port))
+                
+                # Use select to handle both connections efficiently
+                client_socket.setblocking(0)
+                server_socket.setblocking(0)
+                
+                is_active = True
+                while is_active:
+                    # Wait for data on either socket
+                    readable, _, exceptional = select.select(
+                        [client_socket, server_socket], [], [client_socket, server_socket], 60
+                    )
+                    
+                    if not readable and not exceptional:  # Timeout with no activity
+                        break
+                    
+                    # Handle readable sockets
+                    for sock in readable:
+                        try:
+                            if sock == client_socket:  # Client -> Server
+                                data = sock.recv(8192)
+                                if not data:
+                                    is_active = False
+                                    break
+                                server_socket.sendall(data)
+                                bytes_to_server += len(data)
+                            else:  # Server -> Client
+                                data = sock.recv(8192)
+                                if not data:
+                                    is_active = False
+                                    break
+                                client_socket.sendall(data)
+                                bytes_to_client += len(data)
+                        except (ConnectionResetError, BrokenPipeError, socket.error) as e:
+                            self.logger.debug(f"Socket error in CONNECT tunnel: {e}")
+                            is_active = False
                             break
-                        server_socket.sendall(data)
-                except:
-                    pass
-                finally:
-                    server_socket.close()
+                    
+                    # Handle exceptional conditions
+                    for sock in exceptional:
+                        self.logger.debug(f"Exception condition on socket in CONNECT tunnel")
+                        is_active = False
+                        break
+                
+                # Clean up
+                server_socket.close()
             
-            def forward_to_client():
-                try:
-                    while True:
-                        data = server_socket.recv(4096)
-                        if not data:
-                            break
-                        client_socket.sendall(data)
-                except:
-                    pass
-                finally:
-                    client_socket.close()
+            # Record end time and log statistics
+            end_time = time.time()
+            duration = end_time - start_time
             
-            # Start forwarding threads
-            threading.Thread(target=forward_to_server, daemon=True).start()
-            threading.Thread(target=forward_to_client, daemon=True).start()
+            self.logger.info(f"HTTPS tunnel to {host}:{port} closed after {duration:.2f} seconds")
+            self.logger.info(f"HTTPS tunnel statistics: {bytes_to_server} bytes sent, {bytes_to_client} bytes received")
+            
+            # Log a simplified response summary for the CONNECT tunnel
+            summary_headers = {
+                'statusline': 'HTTPS Connection (Encrypted)',
+                'Host': host,
+                'Port': str(port),
+                'Duration': f"{duration:.2f} seconds",
+                'Client-Bytes-Sent': str(bytes_to_server),
+                'Server-Bytes-Received': str(bytes_to_client)
+            }
+            self.logger.debug(format_http_message(summary_headers, b"[Encrypted HTTPS Data]", is_request=False))
             
         except Exception as e:
             self.logger.error(f"Error establishing CONNECT tunnel: {e}")
@@ -337,7 +506,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
-def run_server(host, port, target, log_file, transparent=False, truncate_limit=10000):
+def run_server(host, port, target, log_file, transparent=False, truncate_limit=10000, cert_file=None, key_file=None):
     """Run the HTTP proxy server"""
     # Set up logger
     logger = setup_logging(log_file)
@@ -346,6 +515,31 @@ def run_server(host, port, target, log_file, transparent=False, truncate_limit=1
     ProxyHTTPRequestHandler.logger = logger
     ProxyHTTPRequestHandler.transparent_mode = transparent
     ProxyHTTPRequestHandler.truncate_limit = truncate_limit
+    
+    # Set up SSL interception if certificate and key are provided
+    if cert_file and key_file:
+        try:
+            # Ensure certificate files exist
+            generate_self_signed_cert(cert_file, key_file)
+            
+            # Create SSL context
+            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+            
+            # Disable certificate verification (since we're using a self-signed cert)
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            ProxyHTTPRequestHandler.ssl_context = ssl_context
+            ProxyHTTPRequestHandler.cert_file = cert_file
+            ProxyHTTPRequestHandler.key_file = key_file
+            logger.info(f"HTTPS interception enabled with certificate: {cert_file}")
+        except Exception as e:
+            logger.error(f"Failed to initialize SSL context: {e}")
+            logger.info("Continuing without HTTPS interception")
+            ProxyHTTPRequestHandler.ssl_context = None
+    else:
+        ProxyHTTPRequestHandler.ssl_context = None
     
     if not transparent and target:
         # Parse target URL for direct mode
@@ -367,6 +561,7 @@ def run_server(host, port, target, log_file, transparent=False, truncate_limit=1
     else:
         logger.info(f"Mode: Direct (will proxy all requests to: {target})")
     logger.info(f"Log file: {log_file or 'console only'}")
+    logger.info(f"HTTPS interception: {'Enabled' if ProxyHTTPRequestHandler.ssl_context else 'Disabled'}")
     logger.info("Press Ctrl+C to stop the proxy")
     
     try:
@@ -382,16 +577,18 @@ def run_server(host, port, target, log_file, transparent=False, truncate_limit=1
 
 def main():
     """Parse command line arguments and start the server"""
-    parser = argparse.ArgumentParser(description="HTTP Proxy Server with Request/Response Logging")
+    parser = argparse.ArgumentParser(description="HTTP/HTTPS Proxy Server with Request/Response Logging")
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the proxy server to (default: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=8080, help='Port to run the proxy server on (default: 8080)')
     parser.add_argument('--target', type=str, default='http://example.com', help='Target host to proxy to (default: http://example.com). Ignored if --transparent is used.')
     parser.add_argument('--logfile', type=str, default=None, help='Log file to write to (default: console only)')
     parser.add_argument('--transparent', action='store_true', help='Run in transparent mode (proxy to any host requested by the client)')
     parser.add_argument('--truncate-limit', type=int, default=10000, help='Maximum number of characters to display for response/request bodies (default: 10000, 0 for no truncation)')
+    parser.add_argument('--cert', type=str, default=None, help='Path to SSL certificate for HTTPS interception')
+    parser.add_argument('--key', type=str, default=None, help='Path to SSL key for HTTPS interception')
     
     args = parser.parse_args()
-    run_server(args.host, args.port, args.target, args.logfile, args.transparent, args.truncate_limit)
+    run_server(args.host, args.port, args.target, args.logfile, args.transparent, args.truncate_limit, args.cert, args.key)
 
 
 if __name__ == "__main__":
